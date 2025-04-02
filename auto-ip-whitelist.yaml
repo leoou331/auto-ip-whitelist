@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Auto add console login IP to security group whitelist with optimized CloudTrail configuration'
+
+Parameters:
+  UserName:
+    Type: String
+    Description: The IAM user name to monitor for console logins
+  SecurityGroupId:
+    Type: String
+    Description: The security group ID to update (must be valid in PrimaryRegion)
+  CloudTrailName:
+    Type: String
+    Default: 'ConsoleLoginTrail'
+    Description: Name for the CloudTrail
+  SecondaryRegion:
+    Type: String
+    Default: 'cn-north-1'
+    AllowedValues:
+      - 'cn-north-1'
+      - 'cn-northwest-1'
+    Description: The secondary region (always specify the same value regardless of deployment region)
+  PrimaryRegion:
+    Type: String
+    Default: 'cn-northwest-1'
+    AllowedValues:
+      - 'cn-north-1'
+      - 'cn-northwest-1'
+    Description: The primary region where security group is located (always specify the same value regardless of deployment region)
+
+Conditions:
+  IsSecondaryDeployment: !Equals [!Ref "AWS::Region", !Ref SecondaryRegion]
+
+Mappings:
+  # 分区映射表，用于支持不同区域
+  PartitionMap:
+    aws:
+      name: 'aws'
+    aws-cn:
+      name: 'aws-cn'
+    aws-us-gov:
+      name: 'aws-us-gov'
+
+Resources:
+  # S3 存储桶用于存储 CloudTrail 日志
+  CloudTrailLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogsAfterOneMonth
+            Status: Enabled
+            ExpirationInDays: 30  # 减少存储成本，只保留一个月的日志
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 存储桶策略允许 CloudTrail 写入日志
+  CloudTrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${CloudTrailLogBucket}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${CloudTrailLogBucket}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  # CloudWatch Logs 日志组用于 CloudTrail 日志 - 只保留一周
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${CloudTrailName}'
+      RetentionInDays: 7  # 减少为一周以降低成本
+
+  # CloudTrail 角色允许将日志发送到 CloudWatch Logs
+  CloudTrailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cloudtrail-cloudwatch-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  # CloudTrail 配置 - 只捕获控制台登录事件
+  ConsoleLoginTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailLogBucketPolicy
+    Properties:
+      TrailName: !Ref CloudTrailName
+      S3BucketName: !Ref CloudTrailLogBucket
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailRole.Arn
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: true
+      # 只捕获控制台登录事件，减少数据量
+      EventSelectors:
+        - ReadWriteType: ReadOnly
+          IncludeManagementEvents: true
+          # 通过管理事件选择器过滤，只关注登录事件
+          # 注意：CloudTrail 不支持更细粒度的事件过滤，
+          # 但我们可以在 CloudWatch Events 规则中进一步过滤
+
+  # Lambda 执行角色 - 添加跨区域操作权限
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ModifySecurityGroup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+        - PolicyName: CloudTrailAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+
+  # CloudWatch Events 规则监控控制台登录 - 精确匹配以减少触发
+  ConsoleLoginEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Capture console login events for specific user"
+      EventPattern:
+        source:
+          - "aws.signin"
+        detail-type:
+          - "AWS Console Sign In via CloudTrail"
+        detail:
+          userIdentity:
+            type:
+              - "IAMUser"
+            userName:
+              - !Ref UserName
+          eventName:
+            - "ConsoleLogin"
+          responseElements:
+            ConsoleLogin:
+              - "Success"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt AutoAddIPLambda.Arn
+          Id: "AutoAddIPLambdaTarget"
+
+  # Lambda 调用权限
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AutoAddIPLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConsoleLoginEventRule.Arn
+
+  # 自动添加 IP 的 Lambda 函数 - 固定目标区域为 PrimaryRegion
+  AutoAddIPLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Environment:
+        Variables:
+          SECURITY_GROUP_ID: !Ref SecurityGroupId
+          MAX_IPS: '3'
+          # 无论在哪个区域部署，都使用 PrimaryRegion 作为目标区域
+          TARGET_REGION: !Ref PrimaryRegion
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from ipaddress import ip_network
+
+          def handler(event, context):
+              print(f"Event received: {json.dumps(event)}")
+              
+              # 从环境变量获取安全组ID和最大IP数量
+              security_group_id = os.environ['SECURITY_GROUP_ID']
+              max_ips = int(os.environ['MAX_IPS'])
+              # 获取目标区域 - 这是我们要更新安全组的区域
+              target_region = os.environ.get('TARGET_REGION', '')
+              
+              print(f"Current Lambda region: {os.environ.get('AWS_REGION')}")
+              print(f"Target security group region: {target_region}")
+              
+              # 从事件中获取源IP
+              source_ip = event['detail']['sourceIPAddress']
+              if not source_ip or source_ip == 'amazonaws.com':
+                  print("Invalid source IP, skipping")
+                  return
+                  
+              # 为IP添加/32 CIDR
+              cidr_ip = f"{source_ip}/32"
+              
+              # 创建指定区域的EC2客户端
+              ec2 = boto3.client('ec2', region_name=target_region)
+              
+              # 获取当前安全组规则
+              response = ec2.describe_security_groups(GroupIds=[security_group_id])
+              sg = response['SecurityGroups'][0]
+              
+              # 提取现有的入站规则
+              existing_rules = []
+              for rule in sg.get('IpPermissions', []):
+                  if rule.get('FromPort') == 22 and rule.get('ToPort') == 22 and rule.get('IpProtocol') == 'tcp':
+                      # SSH规则
+                      for ip_range in rule.get('IpRanges', []):
+                          existing_rules.append({
+                              'protocol': 'tcp',
+                              'port': 22,
+                              'cidr_ip': ip_range['CidrIp'],
+                              'description': ip_range.get('Description', 'Auto-added by Lambda')
+                          })
+                  if rule.get('FromPort') == 3389 and rule.get('ToPort') == 3389 and rule.get('IpProtocol') == 'tcp':
+                      # RDP规则
+                      for ip_range in rule.get('IpRanges', []):
+                          existing_rules.append({
+                              'protocol': 'tcp',
+                              'port': 3389,
+                              'cidr_ip': ip_range['CidrIp'],
+                              'description': ip_range.get('Description', 'Auto-added by Lambda')
+                          })
+              
+              # 检查当前IP是否已存在
+              ssh_exists = any(r['port'] == 22 and r['cidr_ip'] == cidr_ip for r in existing_rules)
+              rdp_exists = any(r['port'] == 3389 and r['cidr_ip'] == cidr_ip for r in existing_rules)
+              
+              # 获取现有的唯一IP列表（不包括当前IP）
+              unique_ips = set()
+              for rule in existing_rules:
+                  if rule['cidr_ip'] != cidr_ip:
+                      unique_ips.add(rule['cidr_ip'])
+              
+              # 如果现有IP数量已达到最大值，需要删除最旧的IP
+              ips_to_remove = []
+              if len(unique_ips) >= max_ips:
+                  # 按添加顺序排序（这里假设我们没有这个信息，所以随机选择）
+                  ips_to_remove = list(unique_ips)[:len(unique_ips) - max_ips + 1]
+              
+              # 删除需要移除的IP
+              for ip_to_remove in ips_to_remove:
+                  print(f"Removing old IP: {ip_to_remove}")
+                  try:
+                      ec2.revoke_security_group_ingress(
+                          GroupId=security_group_id,
+                          IpPermissions=[
+                              {
+                                  'IpProtocol': 'tcp',
+                                  'FromPort': 22,
+                                  'ToPort': 22,
+                                  'IpRanges': [{'CidrIp': ip_to_remove}]
+                              },
+                              {
+                                  'IpProtocol': 'tcp',
+                                  'FromPort': 3389,
+                                  'ToPort': 3389,
+                                  'IpRanges': [{'CidrIp': ip_to_remove}]
+                              }
+                          ]
+                      )
+                  except Exception as e:
+                      print(f"Error removing IP {ip_to_remove}: {str(e)}")
+              
+              # 添加新的IP规则（如果不存在）
+              if not ssh_exists or not rdp_exists:
+                  print(f"Adding new IP: {cidr_ip}")
+                  
+                  permissions = []
+                  
+                  if not ssh_exists:
+                      permissions.append({
+                          'IpProtocol': 'tcp',
+                          'FromPort': 22,
+                          'ToPort': 22,
+                          'IpRanges': [{'CidrIp': cidr_ip, 'Description': f'Auto-added for console login'}]
+                      })
+                  
+                  if not rdp_exists:
+                      permissions.append({
+                          'IpProtocol': 'tcp',
+                          'FromPort': 3389,
+                          'ToPort': 3389,
+                          'IpRanges': [{'CidrIp': cidr_ip, 'Description': f'Auto-added for console login'}]
+                      })
+                  
+                  if permissions:
+                      try:
+                          ec2.authorize_security_group_ingress(
+                              GroupId=security_group_id,
+                              IpPermissions=permissions
+                          )
+                          print(f"Successfully added {cidr_ip} to security group {security_group_id}")
+                      except Exception as e:
+                          print(f"Error adding IP {cidr_ip}: {str(e)}")
+              else:
+                  print(f"IP {cidr_ip} already exists in security group")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Successfully processed IP: {source_ip}')
+              }
+
+Outputs:
+  LambdaFunction:
+    Description: "Lambda function that updates security group"
+    Value: !Ref AutoAddIPLambda
+  EventRule:
+    Description: "CloudWatch Events rule that triggers the Lambda"
+    Value: !Ref ConsoleLoginEventRule
+  CloudTrailName:
+    Description: "CloudTrail that captures console login events"
+    Value: !Ref ConsoleLoginTrail
+  CloudTrailLogBucket:
+    Description: "S3 bucket storing CloudTrail logs"
+    Value: !Ref CloudTrailLogBucket
+  CloudTrailLogGroup:
+    Description: "CloudWatch Logs group for CloudTrail logs"
+    Value: !Ref CloudTrailLogGroup
+  TargetRegion:
+    Description: "Target region where security group is updated"
+    Value: !Ref PrimaryRegion
+  DeploymentRegion:
+    Description: "Region where this stack is deployed"
+    Value: !Ref "AWS::Region"
+  DeploymentMode:
+    Description: "Indicates if this is a secondary region deployment"
+    Value: !If [IsSecondaryDeployment, "Secondary Deployment", "Primary Deployment"]
+
