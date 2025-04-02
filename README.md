@@ -85,7 +85,7 @@
 ### 通过 AWS 控制台部署
 
 1. **下载 CloudFormation 模板**
-   - 下载 `sg_auto_update_optimized.yaml` 文件到本地
+   - 下载 `auto-ip-whitelist.yaml` 文件到本地
 
 2. **登录 AWS 控制台**
    - 导航到 CloudFormation 服务
@@ -93,7 +93,7 @@
 
 3. **创建主区域堆栈 (如 cn-northwest-1)**
    - 点击 "创建堆栈" > "使用新资源"
-   - 选择 "上传模板文件"，然后上传 `sg_auto_update_optimized.yaml`
+   - 选择 "上传模板文件"，然后上传 `auto-ip-whitelist.yaml`
    - 点击 "下一步"
 
 4. **配置堆栈参数**
@@ -157,7 +157,7 @@
    ```bash
    aws cloudformation create-stack \
      --stack-name AutoAddIPWhitelist \
-     --template-body file://sg_auto_update_optimized.yaml \
+     --template-body file://auto-ip-whitelist.yaml \
      --parameters file://parameters.json \
      --capabilities CAPABILITY_IAM \
      --region cn-northwest-1
@@ -168,7 +168,7 @@
    # 使用完全相同的参数文件，无需修改
    aws cloudformation create-stack \
      --stack-name AutoAddIPWhitelist \
-     --template-body file://sg_auto_update_optimized.yaml \
+     --template-body file://auto-ip-whitelist.yaml \
      --parameters file://parameters.json \
      --capabilities CAPABILITY_IAM \
      --region cn-north-1
