@@ -14,8 +14,8 @@
                                                                                ▼
 ┌─────────────────┐                ┌───────────────┐                ┌───────────────────┐
 │                 │                │               │                │                   │
-│  EC2 Security   │◀───Update─────│  Lambda       │◀───Trigger─────│  CloudWatch       │
-│  Group          │   Security     │  Function     │                │  Events Rule      │
+│  EC2 Security   │◀───Update─────│  Lambda       │◀───Trigger─────│  EventBridge      │
+│  Group          │   Security     │  Function     │                │      Rule         │
 │                 │   Group Rules  │               │                │                   │
 └─────────────────┘                └───────────────┘                └──────────┬────────┘
                                                                                │
