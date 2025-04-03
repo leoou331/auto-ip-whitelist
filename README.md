@@ -30,6 +30,7 @@
 └─────────────────┘                │   retention)  │                └───────────────────┘
                                    └───────────────┘
 ```
+![auto_whitelist](https://github.com/user-attachments/assets/86f09bb5-c747-4c7b-aa2b-04d14ceb317d)
 
 ## 架构流程说明
 
