@@ -26,6 +26,12 @@ Parameters:
       - 'cn-north-1'
       - 'cn-northwest-1'
     Description: The primary region where security group is located (always specify the same value regardless of deployment region)
+  MaxIPs:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: Maximum number of IP addresses to keep in the security group whitelist
 
 Conditions:
   IsSecondaryDeployment: !Equals [!Ref "AWS::Region", !Ref SecondaryRegion]
@@ -172,27 +178,27 @@ Resources:
                   - cloudtrail:LookupEvents
                 Resource: '*'
 
-  # CloudWatch Events 规则监控控制台登录 - 精确匹配以减少触发
+  # CloudWatch Events 规则监控控制台登录 - 修改以支持IAM Identity Center用户
   ConsoleLoginEventRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: "Capture console login events for specific user"
+      Description: "Capture console login events for specific IAM Identity Center user"
       EventPattern:
         source:
           - "aws.signin"
         detail-type:
           - "AWS Console Sign In via CloudTrail"
         detail:
-          userIdentity:
-            type:
-              - "IAMUser"
-            userName:
-              - !Ref UserName
           eventName:
             - "ConsoleLogin"
           responseElements:
             ConsoleLogin:
               - "Success"
+          userIdentity:
+            type:
+              - "AssumedRole"
+            principalId:
+              - {"suffix": !Ref UserName}
       State: "ENABLED"
       Targets:
         - Arn: !GetAtt AutoAddIPLambda.Arn
@@ -218,9 +224,10 @@ Resources:
       Environment:
         Variables:
           SECURITY_GROUP_ID: !Ref SecurityGroupId
-          MAX_IPS: '3'
+          MAX_IPS: !Ref MaxIPs  # 使用参数值
           # 无论在哪个区域部署，都使用 PrimaryRegion 作为目标区域
           TARGET_REGION: !Ref PrimaryRegion
+          USER_NAME: !Ref UserName
       Code:
         ZipFile: |
           import boto3
@@ -236,16 +243,50 @@ Resources:
               max_ips = int(os.environ['MAX_IPS'])
               # 获取目标区域 - 这是我们要更新安全组的区域
               target_region = os.environ.get('TARGET_REGION', '')
+              target_user = os.environ.get('USER_NAME', '')
               
               print(f"Current Lambda region: {os.environ.get('AWS_REGION')}")
               print(f"Target security group region: {target_region}")
+              print(f"Target user to monitor: {target_user}")
+              print(f"Maximum IPs to maintain: {max_ips}")
               
-              # 从事件中获取源IP
-              source_ip = event['detail']['sourceIPAddress']
-              if not source_ip or source_ip == 'amazonaws.com':
-                  print("Invalid source IP, skipping")
-                  return
+              # 从CloudTrail事件中提取信息
+              source_ip = None
+              event_user = None
+              
+              # 从事件详情中提取源IP
+              if 'detail' in event and 'sourceIPAddress' in event['detail']:
+                  source_ip = event['detail']['sourceIPAddress']
                   
+                  # 从事件中提取用户名
+                  if 'userIdentity' in event['detail']:
+                      user_identity = event['detail']['userIdentity']
+                      
+                      # 对于IAM Identity Center用户，通常以AssumedRole形式出现
+                      if user_identity.get('type') == 'AssumedRole' and 'principalId' in user_identity:
+                          principal_id = user_identity['principalId']
+                          # principalId格式通常为: AROAXXXXX:username@domain.com
+                          if ':' in principal_id:
+                              event_user = principal_id.split(':')[1]
+              
+              # 验证提取的用户名和指定的用户名是否匹配
+              if event_user and target_user and event_user != target_user:
+                  print(f"User {event_user} does not match target user {target_user}, skipping")
+                  return {
+                      'statusCode': 200,
+                      'body': 'Event user does not match target user'
+                  }
+              
+              # 验证源IP是否有效
+              if not source_ip or source_ip == 'amazonaws.com':
+                  print(f"Invalid source IP from event: {json.dumps(event)}")
+                  return {
+                      'statusCode': 400,
+                      'body': 'Failed to extract valid source IP from event'
+                  }
+              
+              print(f"Processing login for user: {event_user} from IP: {source_ip}")
+              
               # 为IP添加/32 CIDR
               cidr_ip = f"{source_ip}/32"
               
@@ -329,7 +370,7 @@ Resources:
                           'IpProtocol': 'tcp',
                           'FromPort': 22,
                           'ToPort': 22,
-                          'IpRanges': [{'CidrIp': cidr_ip, 'Description': f'Auto-added for console login'}]
+                          'IpRanges': [{'CidrIp': cidr_ip, 'Description': f'Auto-added for {event_user} login'}]
                       })
                   
                   if not rdp_exists:
@@ -337,7 +378,7 @@ Resources:
                           'IpProtocol': 'tcp',
                           'FromPort': 3389,
                           'ToPort': 3389,
-                          'IpRanges': [{'CidrIp': cidr_ip, 'Description': f'Auto-added for console login'}]
+                          'IpRanges': [{'CidrIp': cidr_ip, 'Description': f'Auto-added for {event_user} login'}]
                       })
                   
                   if permissions:
@@ -382,4 +423,7 @@ Outputs:
   DeploymentMode:
     Description: "Indicates if this is a secondary region deployment"
     Value: !If [IsSecondaryDeployment, "Secondary Deployment", "Primary Deployment"]
+  MaxIPsAllowed:
+    Description: "Maximum number of IP addresses allowed in whitelist"
+    Value: !Ref MaxIPs
 
